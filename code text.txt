@@ -1,0 +1,365 @@
+import os
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from datetime import datetime
+import pandas as pd
+from openpyxl import load_workbook
+
+
+class TaxDataExtractor:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Tax Data Extractor (Updated)")
+        self.root.geometry("1300x700")
+
+        self.folder_path = tk.StringVar()
+        self.data = []
+        self.tree = None
+
+        self._create_widgets()
+
+    def _create_widgets(self):
+        # Top frame
+        top_frame = ttk.Frame(self.root, padding="5")
+        top_frame.pack(fill=tk.X)
+
+        ttk.Label(top_frame, text="Folder:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(top_frame, textvariable=self.folder_path, width=60).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="Browse", command=self._browse_folder).pack(side=tk.LEFT, padx=5)
+        self.process_btn = ttk.Button(top_frame, text="Process Files", command=self._start_processing)
+        self.process_btn.pack(side=tk.LEFT, padx=10)
+
+        # Status & progress
+        self.status_var = tk.StringVar(value="Ready")
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
+        status_bar.pack(fill=tk.X, padx=5, pady=2)
+
+        self.progress = ttk.Progressbar(self.root, mode='indeterminate')
+        self.progress.pack(fill=tk.X, padx=5, pady=5)
+
+        # Treeview
+        tree_frame = ttk.Frame(self.root)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Display order – we keep as original (or we can reorder to match export, but we'll keep as is)
+        columns = ("#1", "#2", "#3", "#4", "#5", "#6", "#7", "#8", "#9", "#10", "#11", "#12", "#13", "#14")
+        headers = [
+            "File Path",
+            "Name",
+            "Post",
+            "PAN",
+            "Grade Inc. Month",
+            "Basic Salary (F20)",
+            "Grade Number (D22)",
+            "Final Grade (I22)",
+            "Grade Before (F21)",
+            "Grade After (F22)",
+            "Incentive Allowance (F28)",
+            "Nal Kosh Katti (F53)",
+            "Jeevan Beema Private (E69)",
+            "Social Security Tax (D102)"
+        ]
+
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=20)
+        for col, header in zip(columns, headers):
+            self.tree.heading(col, text=header)
+            width = 300 if col == "#1" else (120 if col in ("#6","#7","#8","#9","#10","#11","#12","#13","#14") else 150)
+            self.tree.column(col, width=width, anchor=tk.W if col == "#1" else tk.CENTER)
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        self.tree.bind("<Double-1>", self._open_file)
+
+        # Bottom buttons
+        btn_frame = ttk.Frame(self.root, padding="5")
+        btn_frame.pack(fill=tk.X)
+
+        ttk.Button(btn_frame, text="Export to Excel", command=self._export_excel).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Export to HTML", command=self._export_html).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Clear Table", command=self._clear_table).pack(side=tk.LEFT, padx=5)
+
+        # Footer with credit
+        footer = ttk.Label(self.root, text="Created By Bibek Rai (2026)", anchor=tk.E, font=("Arial", 9))
+        footer.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
+
+    def _browse_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.folder_path.set(folder)
+
+    def _start_processing(self):
+        folder = self.folder_path.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error", "Please select a valid folder.")
+            return
+        self.process_btn.config(state=tk.DISABLED)
+        self.status_var.set("Processing...")
+        self.progress.start()
+        threading.Thread(target=self._process_files, args=(folder,), daemon=True).start()
+
+    def _process_files(self, folder):
+        try:
+            self.data = []
+            xlsx_files = [f for f in os.listdir(folder) if f.lower().endswith('.xlsx')]
+            total = len(xlsx_files)
+            if total == 0:
+                self.root.after(0, lambda: messagebox.showinfo("Info", "No .xlsx files found."))
+                self._finish_processing()
+                return
+
+            for idx, filename in enumerate(xlsx_files, 1):
+                filepath = os.path.join(folder, filename)
+                self.root.after(0, lambda f=filepath, idx=idx, total=total: self.status_var.set(
+                    f"Processing {idx}/{total}: {os.path.basename(f)}"))
+                try:
+                    row = self._extract_from_file(filepath)
+                    if row:
+                        self.data.append(row)
+                except Exception:
+                    # skip file on error
+                    pass
+
+            self.root.after(0, self._populate_table)
+            self.root.after(0, lambda: self.status_var.set(f"Done. Processed {len(self.data)} files."))
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Processing failed: {str(e)}"))
+        finally:
+            self.root.after(0, self._finish_processing)
+
+    def _finish_processing(self):
+        self.progress.stop()
+        self.process_btn.config(state=tk.NORMAL)
+
+    def _extract_from_file(self, filepath):
+        try:
+            wb = load_workbook(filepath, data_only=True)
+            ws = wb.active
+
+            def get(cell):
+                val = ws[cell].value
+                return val if val is not None else ""
+
+            return {
+                'filepath': filepath,
+                'name': get('C10'),
+                'post': get('C11'),
+                'pan': get('I10'),
+                'grade_month': get('I16'),
+                'basic_salary': get('F20'),
+                'grade_number': get('D22'),
+                'final_grade': get('I22'),
+                'grade_before': get('F21'),
+                'grade_after': get('F22'),
+                'incentive_allowance': get('F28'),
+                'nal_kosh': get('F53'),
+                'jeevan_beema_private': get('E69'),
+                'social_security_tax': get('D102')
+            }
+        except Exception:
+            return None
+
+    def _populate_table(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        for row in self.data:
+            values = (
+                row['filepath'],
+                row['name'],
+                row['post'],
+                row['pan'],
+                row['grade_month'],
+                row['basic_salary'],
+                row['grade_number'],
+                row['final_grade'],
+                row['grade_before'],
+                row['grade_after'],
+                row['incentive_allowance'],
+                row['nal_kosh'],
+                row['jeevan_beema_private'],
+                row['social_security_tax']
+            )
+            self.tree.insert("", tk.END, values=values)
+
+    def _open_file(self, event):
+        item = self.tree.selection()
+        if not item:
+            return
+        values = self.tree.item(item[0], 'values')
+        if not values:
+            return
+        filepath = values[0]
+        if os.path.exists(filepath):
+            try:
+                os.startfile(filepath)
+            except AttributeError:
+                import subprocess
+                if sys.platform == 'darwin':
+                    subprocess.run(['open', filepath])
+                else:
+                    subprocess.run(['xdg-open', filepath])
+        else:
+            messagebox.showerror("Error", f"File not found:\n{filepath}")
+
+    def _clear_table(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.data = []
+        self.status_var.set("Table cleared")
+
+    def _make_default_filename(self, ext=".xlsx"):
+        now = datetime.now()
+        return now.strftime(f"%B%d_TaxDataExtracted_Version_%H%M%S{ext}")
+
+    def _export_excel(self):
+        if not self.data:
+            messagebox.showwarning("No data", "No data to export.")
+            return
+        try:
+            df = pd.DataFrame(self.data)
+            # Reorder columns as requested for export
+            export_cols = [
+                'pan', 'name', 'social_security_tax', 'post', 'grade_month',
+                'basic_salary', 'grade_number', 'final_grade',
+                'grade_before', 'grade_after', 'incentive_allowance',
+                'nal_kosh', 'jeevan_beema_private', 'filepath'
+            ]
+            df = df[export_cols]
+            df.columns = [
+                'PAN', 'Name', 'Social Security Tax (D102)', 'Post',
+                'Grade Inc. Month', 'Basic Salary (F20)', 'Grade Number (D22)',
+                'Final Grade (I22)', 'Grade Before (F21)', 'Grade After (F22)',
+                'Incentive Allowance (F28)', 'Nal Kosh Katti (F53)',
+                'Jeevan Beema Private (E69)', 'File Path'
+            ]
+
+            default_name = self._make_default_filename(".xlsx")
+            outfile = filedialog.asksaveasfilename(
+                defaultextension=".xlsx",
+                filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+                initialfile=default_name
+            )
+            if not outfile:
+                return
+
+            with pd.ExcelWriter(outfile, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='Data')
+                workbook = writer.book
+                worksheet = writer.sheets['Data']
+                # Add hyperlink in the last column (File Path)
+                file_col_idx = len(df.columns)  # column index (1-based) after header
+                for row_idx, (_, row) in enumerate(df.iterrows(), start=2):
+                    file_path = row['File Path']
+                    cell = worksheet.cell(row=row_idx, column=file_col_idx)
+                    if os.path.exists(file_path):
+                        cell.hyperlink = file_path
+                        cell.value = os.path.basename(file_path)
+                        cell.style = "Hyperlink"
+                    else:
+                        cell.value = file_path
+
+            messagebox.showinfo("Export", f"Data exported to:\n{outfile}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export Excel:\n{str(e)}")
+
+    def _export_html(self):
+        if not self.data:
+            messagebox.showwarning("No data", "No data to export.")
+            return
+        try:
+            df = pd.DataFrame(self.data)
+            # Reorder columns as requested
+            export_cols = [
+                'pan', 'name', 'social_security_tax', 'post', 'grade_month',
+                'basic_salary', 'grade_number', 'final_grade',
+                'grade_before', 'grade_after', 'incentive_allowance',
+                'nal_kosh', 'jeevan_beema_private', 'filepath'
+            ]
+            df = df[export_cols]
+            df.columns = [
+                'PAN', 'Name', 'Social Security Tax (D102)', 'Post',
+                'Grade Inc. Month', 'Basic Salary (F20)', 'Grade Number (D22)',
+                'Final Grade (I22)', 'Grade Before (F21)', 'Grade After (F22)',
+                'Incentive Allowance (F28)', 'Nal Kosh Katti (F53)',
+                'Jeevan Beema Private (E69)', 'File Path'
+            ]
+
+            default_name = self._make_default_filename(".html")
+            outfile = filedialog.asksaveasfilename(
+                defaultextension=".html",
+                filetypes=[("HTML files", "*.html"), ("All files", "*.*")],
+                initialfile=default_name
+            )
+            if not outfile:
+                return
+
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head><meta charset="UTF-8">
+            <title>Tax Data Extraction Results</title>
+            <style>
+                table { border-collapse: collapse; width: 100%; font-family: Arial; }
+                th, td { border: 1px solid #ddd; padding: 6px; text-align: left; }
+                th { background-color: #f2f2f2; }
+                tr:nth-child(even) { background-color: #f9f9f9; }
+                a { color: #0645ad; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+            </style>
+            </head>
+            <body>
+            <h2>Tax Data Extraction Results</h2>
+            <table>
+                <thead><tr>
+            """
+            # generate header from columns
+            for col in df.columns:
+                html += f"<th>{col}</th>"
+            html += "</tr></thead><tbody>"
+
+            for _, row in df.iterrows():
+                html += "<tr>"
+                for col in df.columns:
+                    value = row[col]
+                    if col == "File Path":
+                        filepath = value
+                        filename = os.path.basename(filepath)
+                        if os.path.exists(filepath):
+                            link = f'<a href="file:///{filepath}">{filename}</a>'
+                        else:
+                            link = filepath
+                        html += f"<td>{link}</td>"
+                    else:
+                        val_str = str(value) if pd.notna(value) else ""
+                        html += f"<td>{val_str}</td>"
+                html += "</tr>"
+
+            html += """
+                </tbody>
+            </table>
+            </body>
+            </html>
+            """
+
+            with open(outfile, 'w', encoding='utf-8') as f:
+                f.write(html)
+
+            messagebox.showinfo("Export", f"Data exported to:\n{outfile}")
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export HTML:\n{str(e)}")
+
+
+if __name__ == "__main__":
+    import sys
+    root = tk.Tk()
+    app = TaxDataExtractor(root)
+    root.mainloop()
